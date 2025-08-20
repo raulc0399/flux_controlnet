@@ -15,37 +15,61 @@ def _():
     repo_name_text = mo.ui.text(value="ox/Finn", label="Repo Name")
     dataset_text = mo.ui.text(value="train.parquet", label="Dataset File")
     images_directory_text = mo.ui.text(value="images", label="Images Directory")
+    conditioning_images_directory_text = mo.ui.text(value="control_images", label="Control Images Directory")
+    
+    # ControlNet configuration
+    use_controlnet_lora_checkbox = mo.ui.checkbox(value=True, label="Use LoRA for ControlNet")
+    num_double_layers_slider = mo.ui.slider(start=1, stop=8, value=4, step=1, label="Number of Double Layers")
+    num_single_layers_slider = mo.ui.slider(start=1, stop=8, value=4, step=1, label="Number of Single Layers")
+    controlnet_conditioning_scale_slider = mo.ui.slider(start=0.1, stop=2.0, value=1.0, step=0.1, label="ControlNet Conditioning Scale")
+    
     hf_api_key_text = mo.ui.text(kind="password", label="Hugging Face API Key")
-    button = mo.ui.run_button(label="Train Model")
+    button = mo.ui.run_button(label="Train ControlNet Model")
     mo.vstack([
         model_name_text,
         repo_name_text,
         dataset_text,
         images_directory_text,
+        conditioning_images_directory_text,
+        mo.md("**ControlNet Configuration**"),
+        use_controlnet_lora_checkbox,
+        num_double_layers_slider,
+        num_single_layers_slider,
+        controlnet_conditioning_scale_slider,
         hf_api_key_text,
         button
     ])
     return (
         button,
+        conditioning_images_directory_text,
+        controlnet_conditioning_scale_slider,
         dataset_text,
         hf_api_key_text,
         images_directory_text,
         mo,
         model_name_text,
+        num_double_layers_slider,
+        num_single_layers_slider,
         repo_name_text,
+        use_controlnet_lora_checkbox,
     )
 
 
 @app.cell
 def _(
     button,
+    conditioning_images_directory_text,
+    controlnet_conditioning_scale_slider,
     dataset_text,
     hf_api_key_text,
     images_directory_text,
     mo,
     model_name_text,
+    num_double_layers_slider,
+    num_single_layers_slider,
     repo_name_text,
     train,
+    use_controlnet_lora_checkbox,
 ):
     mo.stop(not button.value)
 
@@ -54,7 +78,12 @@ def _(
         repo_name_text.value,
         dataset_text.value,
         images_directory_text.value,
-        hf_api_key_text.value
+        conditioning_images_directory_text.value,
+        hf_api_key_text.value,
+        use_controlnet_lora_checkbox.value,
+        num_double_layers_slider.value,
+        num_single_layers_slider.value,
+        controlnet_conditioning_scale_slider.value
     )
     return
 
@@ -72,7 +101,7 @@ def _(
     DataLoader,
     F,
     FlowMatchEulerDiscreteScheduler,
-    FluxDataset,
+    FluxControlNetDataset,
     RemoteRepo,
     bnb,
     datetime,
@@ -94,7 +123,8 @@ def _(
 
     # Add entry point to your CLI app
     @app.command()
-    def train(model_name, repo_name, dataset_file, images_directory, hf_api_key):
+    def train(model_name, repo_name, dataset_file, images_directory, control_images_directory, hf_api_key, 
+              use_controlnet_lora, num_double_layers, num_single_layers, controlnet_conditioning_scale):
         # Must login to Hugging Face to download the weights
         hf_login(hf_api_key)
 
@@ -103,7 +133,8 @@ def _(
         device = torch.device("cuda")
         lora_rank = 16
         lora_alpha = 16
-        models = load_models(model_name, lora_rank, lora_alpha)
+        models = load_models(model_name, lora_rank, lora_alpha, use_controlnet_lora=use_controlnet_lora,
+                           num_double_layers=num_double_layers, num_single_layers=num_single_layers)
 
         config = {
             # Training settings
@@ -111,6 +142,7 @@ def _(
             "dataset_repo": repo_name,
             "dataset_path": dataset_file,
             "images_path": images_directory,
+            "control_images_path": control_images_directory,
             "batch_size": 1,
             "gradient_accumulation_steps": 1,
             "steps": 2000,
@@ -121,6 +153,12 @@ def _(
             # LoRA settings - Updated to match YAML config
             "lora_rank": lora_rank,
             "lora_alpha": lora_alpha,
+            "use_controlnet_lora": use_controlnet_lora,
+            
+            # ControlNet settings
+            "num_double_layers": num_double_layers,
+            "num_single_layers": num_single_layers,
+            "controlnet_conditioning_scale": controlnet_conditioning_scale,
 
             # Save settings
             "save_every": 200,
@@ -143,10 +181,11 @@ def _(
             ]
         }
 
-        dataset = FluxDataset(
+        dataset = FluxControlNetDataset(
             config["dataset_repo"],
             config["dataset_path"],
             config["images_path"],
+            config["control_images_path"],
             trigger_phrase=config["trigger_phrase"]
         )
 
@@ -159,10 +198,12 @@ def _(
         )
 
         # We loaded the model previously, and saved all the components in a tuple
-        (transformer, vae, clip_encoder, t5_encoder, clip_tokenizer, t5_tokenizer) = models
+        (transformer, vae, clip_encoder, t5_encoder, clip_tokenizer, t5_tokenizer, flux_controlnet) = models
 
-        # Make sure the transformer's parameters are trainable
-        transformer.train()
+        # Make sure the transformer's parameters are NOT trainable
+        transformer.eval()
+        # ControlNet should also be trainable
+        flux_controlnet.train()
 
         print("Loading Noise Scheduler")
         # Stable Diffusion 3 https://arxiv.org/abs/2403.03206
@@ -188,8 +229,9 @@ def _(
         print(f"Scheduler config updated: shift={noise_scheduler.config.shift}, use_dynamic_shifting={noise_scheduler.config.use_dynamic_shifting}")
 
         print("Setting up optimizer")
+        # Only train ControlNet parameters, keep transformer frozen
         optimizer = bnb.optim.AdamW8bit(
-            transformer.parameters(),
+            flux_controlnet.parameters(),
             lr=config["learning_rate"],
             betas=(0.9, 0.999),
             weight_decay=0.01,
@@ -243,17 +285,22 @@ def _(
 
                 # Autocast will convert to dtype=bfloat16 and ensure conformity
                 with torch.amp.autocast('cuda', dtype=dtype):
-                    # Grab the images from the batch
+                    # Grab the images and control images from the batch
                     images = batch['image'].to(device, dtype=dtype)
+                    control_images = batch['control_image'].to(device, dtype=dtype)
 
                     # Encode the images to the latent space
                     latents = vae.encode(images).latent_dist.sample()
+                    
+                    # Encode the control images to the latent space
+                    control_latents = vae.encode(control_images).latent_dist.sample()
 
                     # Scale and shift the latents to help with training stability.
                     scaling_factor = vae.config.scaling_factor
                     shift_factor = vae.config.shift_factor
                     # When encoding: (x - shift) * scale
                     latents = (latents - shift_factor) * scaling_factor
+                    control_latents = (control_latents - shift_factor) * scaling_factor
 
                     # CLIP tokenization and encoding
                     clip_inputs = clip_tokenizer(
@@ -320,8 +367,16 @@ def _(
                     # zt = (1 − t)x0 + tϵ
                     noisy_latents = (1.0 - t_01) * latents + t_01 * noise
 
-                    noisy_latents = rearrange(
+                    # Pack latents for FLUX (similar to FluxControlNetPipeline._pack_latents)
+                    packed_latents = rearrange(
                         noisy_latents,
+                        "b c (h ph) (w pw) -> b (h w) (c ph pw)",
+                        ph=2, pw=2
+                    )
+                    
+                    # Pack control latents
+                    packed_control_latents = rearrange(
+                        control_latents,
                         "b c (h ph) (w pw) -> b (h w) (c ph pw)",
                         ph=2, pw=2
                     )
@@ -349,12 +404,28 @@ def _(
 
                     # Forward pass - Use consistent timestep scaling
                     timestep_scaled = timesteps.float() / num_timesteps  # Consistent with t_01 scaling
+                    
+                    # ControlNet forward pass
+                    controlnet_block_samples, controlnet_single_block_samples = flux_controlnet(
+                        hidden_states=packed_latents,
+                        controlnet_cond=packed_control_latents,
+                        timestep=timestep_scaled,
+                        guidance=guidance,
+                        pooled_projections=pooled_embeds,
+                        encoder_hidden_states=prompt_embeds,
+                        txt_ids=txt_ids,
+                        img_ids=img_ids,
+                        return_dict=False,
+                    )
 
+                    # Transformer forward pass with ControlNet conditioning
                     noise_pred = transformer(
-                        hidden_states=noisy_latents,
+                        hidden_states=packed_latents,
                         timestep=timestep_scaled,
                         encoder_hidden_states=prompt_embeds,
                         pooled_projections=pooled_embeds,
+                        controlnet_block_samples=controlnet_block_samples,
+                        controlnet_single_block_samples=controlnet_single_block_samples,
                         txt_ids=txt_ids,
                         img_ids=img_ids,
                         guidance=guidance,
@@ -385,7 +456,7 @@ def _(
 
                     # Clip global L2 norm of all gradients to ≤1.0 to prevent exploding updates
                     # Helpful when training in bfloat16. It also plays well with AdamW.
-                    torch.nn.utils.clip_grad_norm_(transformer.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(flux_controlnet.parameters(), 1.0)
 
                     # Optimizer step to update the weights
                     optimizer.step()
@@ -407,7 +478,7 @@ def _(
                     if global_step % config["sample_every"] == 0:
                         image_paths = generate_samples(
                             config, transformer, vae, clip_encoder, t5_encoder,
-                            clip_tokenizer, t5_tokenizer, noise_scheduler,
+                            clip_tokenizer, t5_tokenizer, noise_scheduler, flux_controlnet,
                             config["sample_prompts"], # Generate samples from the config prompt list
                             output_dir, global_step, device, dtype
                         )
@@ -427,10 +498,10 @@ def _(
 
                     # Save checkpoint
                     if global_step % config["save_every"] == 0:
-                        save_path = f"flux_lora_step_{global_step}.safetensors"
+                        save_path = f"flux_controlnet_step_{global_step}.safetensors"
 
                         # Save model weights
-                        write_and_save_results(transformer, repo, output_dir, save_path, training_logs, image_logs)
+                        write_and_save_results(flux_controlnet, repo, output_dir, save_path, training_logs, image_logs)
 
                     global_step += 1
 
@@ -439,21 +510,22 @@ def _(
                     flush_memory()
 
         # Final save
-        final_save_path = os.path.join(output_dir, "flux_lora_final.safetensors")
-        write_and_save_results(transformer, repo, output_dir, "flux_lora_final.safetensors", training_logs, image_logs)
+        final_save_path = os.path.join(output_dir, "flux_controlnet_final.safetensors")
+        write_and_save_results(flux_controlnet, repo, output_dir, "flux_controlnet_final.safetensors", training_logs, image_logs)
 
         print("Training completed!")
     return app, train
 
 
 @app.cell
-def _(FluxPipeline, flush_memory, os, torch):
+def _(FluxControlNetPipeline, flush_memory, os, torch):
     @torch.no_grad()
     def generate_samples(config, transformer, vae, text_encoder, text_encoder_2, tokenizer, tokenizer_2,
-                        scheduler, prompts, output_dir, step, device, dtype):
+                        scheduler, flux_controlnet, prompts, output_dir, step, device, dtype):
         """Generate sample images during training"""
 
         transformer.eval()
+        flux_controlnet.eval()
 
         # This matches ai-toolkit's approach better
         sample_dtype = torch.float32 if dtype == torch.bfloat16 else dtype
@@ -463,9 +535,10 @@ def _(FluxPipeline, flush_memory, os, torch):
         text_encoder = text_encoder.to(device=device, dtype=sample_dtype)
         text_encoder_2 = text_encoder_2.to(device=device, dtype=sample_dtype)
 
-        # Create pipeline for sampling
-        pipeline = FluxPipeline(
+        # Create ControlNet pipeline for sampling
+        pipeline = FluxControlNetPipeline(
             transformer=transformer,
+            controlnet=flux_controlnet,
             vae=vae,
             text_encoder=text_encoder,
             text_encoder_2=text_encoder_2,
@@ -477,6 +550,16 @@ def _(FluxPipeline, flush_memory, os, torch):
         # Move pipeline to device with compatible dtype
         pipeline = pipeline.to(device=device, dtype=sample_dtype)
 
+        # Load a control image for sampling (use first one from dataset)
+        from PIL import Image as PILImage
+        try:
+            control_image_path = os.path.join(config["control_images_path"], os.listdir(config["control_images_path"])[0])
+            control_image = PILImage.open(control_image_path).convert('RGB')
+            control_image = control_image.resize((config["sample_width"], config["sample_height"]), PILImage.LANCZOS)
+        except:
+            # If no control image available, create a simple black image
+            control_image = PILImage.new('RGB', (config["sample_width"], config["sample_height"]), (0, 0, 0))
+        
         image_paths = []
         try:
             for i, prompt in enumerate(prompts):
@@ -489,10 +572,12 @@ def _(FluxPipeline, flush_memory, os, torch):
 
                 image = pipeline(
                     prompt=prompt,
+                    control_image=control_image,
                     width=config["sample_width"],
                     height=config["sample_height"],
                     num_inference_steps=config["sample_steps"],
                     guidance_scale=config["guidance_scale"],
+                    controlnet_conditioning_scale=config["controlnet_conditioning_scale"],
                     generator=torch.Generator(device=device).manual_seed(42 + i),
                 ).images[0]
 
@@ -515,7 +600,8 @@ def _(FluxPipeline, flush_memory, os, torch):
             print(f"Full traceback: {traceback.format_exc()}")
 
         finally:
-            transformer.train()
+            # transformer.train()
+            flux_controlnet.train()
 
             # Restore original dtypes
             vae = vae.to(device=device, dtype=dtype)
@@ -542,11 +628,11 @@ def _(gc, torch):
 
 @app.cell
 def _(e, json, os, save_lora_weights, torch):
-    def write_and_save_results(transformer, repo, output_dir, lora_name, training_logs, image_logs):
+    def write_and_save_results(model, repo, output_dir, model_name, training_logs, image_logs):
         try:
             # Final save
-            final_save_path = os.path.join(output_dir, lora_name)
-            save_lora_weights(transformer, final_save_path, torch.float16)
+            final_save_path = os.path.join(output_dir, model_name)
+            save_lora_weights(model, final_save_path, torch.float16)
 
             # Save training logs
             training_logs_file = os.path.join(output_dir, "training_logs.jsonl")
@@ -579,18 +665,23 @@ def _(e, json, os, save_lora_weights, torch):
 
 @app.cell
 def _(Dataset, Image, RemoteRepo, os, pd, random, transforms):
-    class FluxDataset(Dataset):
-        """Dataset for loading images and captions for Flux training"""
+    class FluxControlNetDataset(Dataset):
+        """Dataset for loading images, captions, and control images for Flux ControlNet training"""
 
-        def __init__(self, dataset_repo, dataset_path, images_path, resolutions=[512, 768, 1024], trigger_phrase=None):
+        def __init__(self, dataset_repo, dataset_path, images_path, control_images_path, resolutions=[512, 768, 1024], trigger_phrase=None):
             self.repo = RemoteRepo(dataset_repo)
             self.resolutions = resolutions
             self.trigger_phrase = trigger_phrase
             self.images_path = images_path
+            self.control_images_path = control_images_path
 
             if not os.path.exists(images_path):
                 print("Downloading images")
                 self.repo.download(images_path)
+                
+            if not os.path.exists(control_images_path):
+                print("Downloading control images")
+                self.repo.download(control_images_path)
 
             if not os.path.exists(dataset_path):
                 print("Downloading dataset")
@@ -599,12 +690,19 @@ def _(Dataset, Image, RemoteRepo, os, pd, random, transforms):
             # Load the dataset
             df = pd.read_parquet(dataset_path)
 
-            # Read all images and captions
+            # Read all images, captions, and control images
             self.image_files = []
+            self.control_image_files = []
             self.captions = []
             for index, row in df.iterrows():
                 self.image_files.append(row['image'])
                 self.captions.append(row['action'])
+                # Assume control image has same name as regular image or use 'control_image' column if available
+                if 'control_image' in row:
+                    self.control_image_files.append(row['control_image'])
+                else:
+                    # Use same filename for control image (assumes same naming)
+                    self.control_image_files.append(row['image'])
 
             # Setup transforms
             # You could add cropping and rotating here if you wanted
@@ -619,10 +717,12 @@ def _(Dataset, Image, RemoteRepo, os, pd, random, transforms):
             return len(self.image_files)
 
         def __getitem__(self, idx):
-            # Load image
+            # Load image and control image
             image_path = self.image_files[idx]
+            control_image_path = self.control_image_files[idx]
             caption = self.captions[idx]
             image = Image.open(os.path.join(self.images_path, image_path)).convert('RGB')
+            control_image = Image.open(os.path.join(self.control_images_path, control_image_path)).convert('RGB')
 
             # Add trigger word if specified and not already present
             if self.trigger_phrase and self.trigger_phrase not in caption:
@@ -645,15 +745,19 @@ def _(Dataset, Image, RemoteRepo, os, pd, random, transforms):
             new_height = (new_height // 16) * 16
 
             image = image.resize((new_width, new_height), Image.LANCZOS)
+            control_image = control_image.resize((new_width, new_height), Image.LANCZOS)
+            
             image = self.transform(image)
+            control_image = self.transform(control_image)
 
             return {
                 'image': image,
+                'control_image': control_image,
                 'caption': caption,
                 'width': new_width,
                 'height': new_height
             }
-    return (FluxDataset,)
+    return (FluxControlNetDataset,)
 
 
 @app.cell
@@ -661,6 +765,7 @@ def _(
     AutoencoderKL,
     CLIPTextModel,
     CLIPTokenizer,
+    FluxControlNetModel,
     FluxTransformer2DModel,
     LoraConfig,
     T5EncoderModel,
@@ -668,7 +773,8 @@ def _(
     get_peft_model,
     torch,
 ):
-    def load_models(model_name, lora_rank=16, lora_alpha=16, dtype=torch.bfloat16, device="cuda"):
+    def load_models(model_name, lora_rank=16, lora_alpha=16, dtype=torch.bfloat16, device="cuda", 
+                   use_controlnet_lora=True, num_double_layers=4, num_single_layers=4):
         # Transfor all the models to the GPU device at the end
         device = torch.device(device)
 
@@ -680,7 +786,8 @@ def _(
             torch_dtype=dtype
         )
         # For more efficient memory usage during training
-        transformer.enable_gradient_checkpointing()
+        # transformer.enable_gradient_checkpointing()
+        transformer.eval()
 
         # Apply LoRA
         print("Applying LoRA FluxTransformer2DModel")
@@ -739,15 +846,44 @@ def _(
             subfolder="tokenizer_2"
         )
 
+        # Initialize ControlNet
+        print("Loading FluxControlNetModel")
+        flux_controlnet = FluxControlNetModel.from_transformer(
+            transformer,
+            attention_head_dim=transformer.config["attention_head_dim"],
+            num_attention_heads=transformer.config["num_attention_heads"],
+            num_layers=num_double_layers,
+            num_single_layers=num_single_layers,
+        )
+        flux_controlnet.enable_gradient_checkpointing()
+        
+        # Apply LoRA to ControlNet if requested
+        if use_controlnet_lora:
+            print("Applying LoRA to FluxControlNetModel")
+            controlnet_target_modules = [
+                "to_q", "to_k", "to_v", "to_out.0",  # Attention layers
+                "ff.net.0.proj", "ff.net.2",        # MLP layers
+            ]
+            controlnet_lora_config = LoraConfig(
+                r=lora_rank,
+                lora_alpha=lora_alpha,
+                target_modules=controlnet_target_modules,
+                lora_dropout=0.0,
+                bias="none",
+            )
+            flux_controlnet = get_peft_model(flux_controlnet, controlnet_lora_config)
+            flux_controlnet.print_trainable_parameters()
+        
         # Move models to GPU
         print("Moving models to GPU")
         transformer = transformer.to(device)
         vae = vae.to(device)
         text_encoder = text_encoder.to(device)
         text_encoder_2 = text_encoder_2.to(device)
+        flux_controlnet = flux_controlnet.to(device)
 
         # Return all the models together
-        return (transformer, vae, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+        return (transformer, vae, text_encoder, text_encoder_2, tokenizer, tokenizer_2, flux_controlnet)
     return (load_models,)
 
 
@@ -783,6 +919,8 @@ def _():
         AutoencoderKL,
         FluxPipeline
     )
+    from diffusers.models.controlnets.controlnet_flux import FluxControlNetModel
+    from diffusers.pipelines.flux.pipeline_flux_controlnet import FluxControlNetPipeline
     from transformers import T5TokenizerFast, T5EncoderModel, CLIPTextModel, CLIPTokenizer
     from peft import LoraConfig, get_peft_model, TaskType, get_peft_model_state_dict
     from einops import rearrange, repeat
@@ -802,6 +940,8 @@ def _():
         Dataset,
         F,
         FlowMatchEulerDiscreteScheduler,
+        FluxControlNetModel,
+        FluxControlNetPipeline,
         FluxPipeline,
         FluxTransformer2DModel,
         Image,
