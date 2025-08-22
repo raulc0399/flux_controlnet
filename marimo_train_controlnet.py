@@ -15,7 +15,6 @@ def _():
     repo_name_text = mo.ui.text(value="raulc/open_pose_controlnet_dataset_small", label="Repo Name")
     dataset_text = mo.ui.text(value="train.parquet", label="Dataset File")
     images_directory_text = mo.ui.text(value="images", label="Images Directory")
-    conditioning_images_directory_text = mo.ui.text(value="control_images", label="Control Images Directory")
     
     # ControlNet configuration
     use_controlnet_lora_checkbox = mo.ui.checkbox(value=True, label="Use LoRA for ControlNet")
@@ -30,7 +29,6 @@ def _():
         repo_name_text,
         dataset_text,
         images_directory_text,
-        conditioning_images_directory_text,
         mo.md("**ControlNet Configuration**"),
         use_controlnet_lora_checkbox,
         num_double_layers_slider,
@@ -41,7 +39,6 @@ def _():
     ])
     return (
         button,
-        conditioning_images_directory_text,
         controlnet_conditioning_scale_slider,
         dataset_text,
         hf_api_key_text,
@@ -58,7 +55,6 @@ def _():
 @app.cell
 def _(
     button,
-    conditioning_images_directory_text,
     controlnet_conditioning_scale_slider,
     dataset_text,
     hf_api_key_text,
@@ -78,7 +74,6 @@ def _(
         repo_name_text.value,
         dataset_text.value,
         images_directory_text.value,
-        conditioning_images_directory_text.value,
         hf_api_key_text.value,
         use_controlnet_lora_checkbox.value,
         num_double_layers_slider.value,
@@ -123,7 +118,7 @@ def _(
 
     # Add entry point to your CLI app
     @app.command()
-    def train(model_name, repo_name, dataset_file, images_directory, control_images_directory, hf_api_key, 
+    def train(model_name, repo_name, dataset_file, images_directory, hf_api_key, 
               use_controlnet_lora, num_double_layers, num_single_layers, controlnet_conditioning_scale):
         # Must login to Hugging Face to download the weights
         hf_login(hf_api_key)
@@ -142,7 +137,6 @@ def _(
             "dataset_repo": repo_name,
             "dataset_path": dataset_file,
             "images_path": images_directory,
-            "control_images_path": control_images_directory,
             "batch_size": 1,
             "gradient_accumulation_steps": 1,
             "steps": 2000,
