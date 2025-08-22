@@ -12,7 +12,7 @@ def _():
 
     # https://huggingface.co/black-forest-labs/FLUX.1-dev
     model_name_text = mo.ui.text(value="black-forest-labs/FLUX.1-dev", label="Model Name")
-    repo_name_text = mo.ui.text(value="ox/Finn", label="Repo Name")
+    repo_name_text = mo.ui.text(value="raulc/open_pose_controlnet_dataset_small", label="Repo Name")
     dataset_text = mo.ui.text(value="train.parquet", label="Dataset File")
     images_directory_text = mo.ui.text(value="images", label="Images Directory")
     conditioning_images_directory_text = mo.ui.text(value="control_images", label="Control Images Directory")
@@ -678,11 +678,7 @@ def _(Dataset, Image, RemoteRepo, os, pd, random, transforms):
             if not os.path.exists(images_path):
                 print("Downloading images")
                 self.repo.download(images_path)
-                
-            if not os.path.exists(control_images_path):
-                print("Downloading control images")
-                self.repo.download(control_images_path)
-
+            
             if not os.path.exists(dataset_path):
                 print("Downloading dataset")
                 self.repo.download(dataset_path)
@@ -697,9 +693,9 @@ def _(Dataset, Image, RemoteRepo, os, pd, random, transforms):
             for index, row in df.iterrows():
                 self.image_files.append(row['image'])
                 self.captions.append(row['action'])
-                # Assume control image has same name as regular image or use 'control_image' column if available
-                if 'control_image' in row:
-                    self.control_image_files.append(row['control_image'])
+                # Assume control image has same name as regular image or use 'conditioning_image' column if available
+                if 'conditioning_image' in row:
+                    self.control_image_files.append(row['conditioning_image'])
                 else:
                     # Use same filename for control image (assumes same naming)
                     self.control_image_files.append(row['image'])
